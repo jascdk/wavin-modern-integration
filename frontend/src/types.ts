@@ -23,10 +23,15 @@ export interface ApiStatus {
 export interface Zone {
   id: number;
   name: string;
-  temp: number;
-  target: number;
+  currentTemp: number | null;
+  targetTemp: number | null;
+  minTemp: number | null;
+  maxTemp: number | null;
+  comfortTemp: number | null;
+  ecoTemp: number | null;
   mode: 'auto' | 'manual' | 'away' | 'off';
   online: boolean;
+  lastUpdated: string | null;
 }
 
 export interface ActivityEntry {

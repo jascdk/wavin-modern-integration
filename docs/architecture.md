@@ -25,44 +25,71 @@ topics**, which keeps either side replaceable.
 - React + Vite + TypeScript SPA served by nginx in production.
 - Talks to the backend only via `VITE_API_BASE_URL` (baked in at build time).
 - Polls `/api/status` and `/api/zones`; renders status cards, zones table, activity log.
-- Contains **no** hardware knowledge.
+- Zone target temperature is editable in the zones table (`ZonesTable.tsx`); edits call
+  `PATCH /api/zones/:id` via `setZoneTarget()` (`api/client.ts`). Controls are disabled
+  when MQTT is disconnected or the zone itself is reported offline.
+- Contains **no** hardware knowledge — it only understands the internal `Zone` model.
 
 ### Backend (`backend/`)
 
 - Node.js + Express + TypeScript.
 - `src/config/` — environment parsing, single source of truth for settings.
-- `src/routes/` — HTTP surface (`/health`, `/api/status`, `/api/zones`).
+- `src/routes/` — HTTP surface (`/health`, `/api/status`, `/api/zones`,
+  `PATCH /api/zones/:id`).
 - `src/services/mqttService.ts` — MQTT connection lifecycle (connect / reconnect /
-  close / error), in-memory status object, safe JSON payload parsing, placeholder
-  subscription to `<MQTT_BASE_TOPIC>/#`.
-- `src/services/zoneService.ts` — placeholder zone data, to be replaced by live state.
+  close / error), in-memory status object, safe JSON payload parsing, subscription to
+  `<MQTT_BASE_TOPIC>/#`, and `publishSetpoint()` for outgoing setpoint commands.
+- `src/services/adapters/wavinAhc9000.ts` — the only module that knows the MQTT topic
+  layout and JSON payload schema shared with `wavin_ahc9000_advanced_mqtt`; parses
+  `<baseTopic>/<zoneId>/state` messages into `Zone` patches and builds
+  `<baseTopic>/<zoneId>/set` setpoint commands. Covered by unit tests
+  (`wavinAhc9000.test.ts`) guarding against field mix-ups (e.g. current vs. target,
+  comfort vs. eco).
+- `src/services/zoneService.ts` — live, in-memory zone store keyed by zone id, updated
+  exclusively by the adapter as state messages arrive; starts empty until the first
+  MQTT message for a zone is received.
 
 ## Integration boundaries
 
-| Boundary              | Contract                                                            |
-| --------------------- | ------------------------------------------------------------------- |
-| Browser ↔ backend     | REST/JSON over HTTP; CORS allow-list via `CORS_ORIGIN`              |
-| Backend ↔ broker      | MQTT via `MQTT_URL`; subscribes to `<MQTT_BASE_TOPIC>/#`            |
-| Broker ↔ ESP32 bridge | Owned entirely by `wavin_ahc9000_advanced_mqtt`                     |
+| Boundary              | Contract                                                             |
+| --------------------- | ---------------------------------------------------------------------|
+| Browser ↔ backend     | REST/JSON over HTTP; CORS allow-list via `CORS_ORIGIN`               |
+| Backend ↔ broker      | MQTT via `MQTT_URL`; subscribes to `<MQTT_BASE_TOPIC>/#`, publishes   |
+|                        | setpoint commands to `<MQTT_BASE_TOPIC>/<zoneId>/set`                 |
+| Broker ↔ ESP32 bridge | Owned entirely by `wavin_ahc9000_advanced_mqtt`                      |
 
-The only shared contract between the two repositories is the **MQTT topic layout and
-payload schema** under the configured base topic (default `wavin/`).
+The shared contract between the two repositories is the MQTT topic layout and JSON
+payload schema under the configured base topic (default `wavin/`), implemented in
+`backend/src/services/adapters/wavinAhc9000.ts`:
 
-## Future adapter: wavin_ahc9000_advanced_mqtt
+- **State** (subscribed): `<baseTopic>/<zoneId>/state` — JSON object with optional
+  `name`, `current_temp`, `target_temp`, `min_temp`, `max_temp`, `comfort_temp`,
+  `eco_temp`, `mode` (`auto`/`manual`/`away`/`off`), `online` fields. Unknown/missing
+  fields are left untouched rather than defaulted, so a partial update never
+  overwrites previously known values with `0`/`false`.
+- **Setpoint command** (published): `<baseTopic>/<zoneId>/set` — `{ "target_temp": number }`.
 
-A planned adapter module (`backend/src/services/adapters/wavinAhc9000.ts`) will:
+This schema is this repo's definition of the contract; it should be reconciled against
+the actual payloads emitted by `wavin_ahc9000_advanced_mqtt` before going live, since
+that firmware currently follows a Home Assistant MQTT-discovery-style layout rather
+than these flat per-zone topics (see that repo's `README.md`). Adjust
+`wavinAhc9000.ts` accordingly if the real topic/payload names differ.
 
-1. Map topics published by the ESP32 bridge (e.g. `wavin/<zone>/temperature`,
-   `wavin/<zone>/setpoint`, `wavin/<zone>/mode`) onto the internal `Zone` model.
-2. Replace the placeholder data in `zoneService` with live state built from those
-   messages.
-3. Publish commands (setpoint/mode changes initiated in the UI) back onto the command
-   topics the bridge listens on.
-4. Feed decoded events into the activity log (persisted or streamed via WebSocket/SSE).
+## Adapter status: wavinAhc9000
 
-Until that lands, all zone data and MQTT subscriptions are clearly-marked placeholders,
-so the scaffold runs end-to-end with any MQTT broker — or none at all (the API stays
-up and reports MQTT as disconnected).
+`backend/src/services/adapters/wavinAhc9000.ts` is implemented:
+
+1. Maps `<baseTopic>/<zoneId>/state` messages onto the internal `Zone` model.
+2. `zoneService` is a live store built from those messages (no more hardcoded data).
+3. `mqttService.publishSetpoint()` publishes setpoint changes initiated in the UI back
+   onto `<baseTopic>/<zoneId>/set`.
+4. Zone updates are still only logged to the console; feeding them into a persisted or
+   streamed (WebSocket/SSE) activity log remains future work.
+
+Until the real bridge's topic/payload schema is confirmed, all zone data is empty at
+startup and only populates as matching MQTT messages arrive — the scaffold still runs
+end-to-end with any MQTT broker, or none at all (the API reports MQTT as disconnected
+and the zones table shows "No zones loaded yet").
 
 ## Deployment model
 
