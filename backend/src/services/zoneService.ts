@@ -1,5 +1,7 @@
 export interface Zone {
   id: number;
+  /** MQTT device id (bridge MAC address) this zone was last seen under. */
+  deviceId: string | null;
   name: string;
   currentTemp: number | null;
   targetTemp: number | null;
@@ -32,10 +34,15 @@ export function getZone(id: number): Zone | undefined {
  * payload omits them, so a message that only reports e.g. `current_temp`
  * doesn't wipe out previously known `min_temp`/`max_temp` values.
  */
-export function upsertZone(id: number, patch: Partial<Omit<Zone, 'id'>>): Zone {
+export function upsertZone(
+  id: number,
+  patch: Partial<Omit<Zone, 'id'>>,
+  deviceId?: string,
+): Zone {
   const existing = zones.get(id);
   const merged: Zone = {
     id,
+    deviceId: deviceId ?? existing?.deviceId ?? null,
     name: existing?.name ?? `Zone ${id}`,
     currentTemp: existing?.currentTemp ?? null,
     targetTemp: existing?.targetTemp ?? null,

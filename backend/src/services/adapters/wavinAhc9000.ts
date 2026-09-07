@@ -2,26 +2,40 @@
  * Adapter for jascdk/wavin_ahc9000_advanced_mqtt.
  *
  * The two repositories never share code — they only agree on an MQTT topic
- * layout and JSON payload schema under the configured base topic (default
+ * layout and payload schema under the configured base topic (default
  * `wavin`, see `config.mqtt.baseTopic`). This module is the single place
  * that understands that schema; every other part of the backend only deals
  * with the internal `Zone` model (see `../zoneService.ts`).
  *
- * Topic layout (relative to `<baseTopic>`):
- *   - State (subscribed):  `<baseTopic>/<zoneId>/state`
- *       JSON payload: {
- *         name?: string,
- *         current_temp?: number,
- *         target_temp?: number,
- *         min_temp?: number,
- *         max_temp?: number,
- *         comfort_temp?: number,
- *         eco_temp?: number,
- *         mode?: 'auto' | 'manual' | 'away' | 'off',
- *         online?: boolean,
- *       }
- *   - Setpoint command (published): `<baseTopic>/<zoneId>/set`
- *       JSON payload: { target_temp: number }
+ * Real-world topic layout (as published by the ESP32 bridge firmware),
+ * relative to `<baseTopic>`:
+ *
+ *   `<baseTopic>/<deviceId>/<zoneId>/<field>`
+ *
+ * where `<deviceId>` is the bridge's MAC address (e.g. `0C:8B:95:94:5B:7C`),
+ * `<zoneId>` is a room number (or the literal `master` for the whole-house
+ * virtual thermostat, which is not modeled as a zone here), and `<field>` is
+ * one of several independently-published values per zone:
+ *
+ *   - `current_temp`  — plain number, e.g. `22.6`
+ *   - `target_temp`   — plain number, e.g. `17`
+ *   - `battery`       — plain number (percent)
+ *   - `rssi`          — plain number (dBm)
+ *   - `current_draw`  — plain number (mA)
+ *   - `attributes`    — JSON object with (among others): `room`, `min_temp`,
+ *     `max_temp`, `comfort_temp`, `eco_temp`, `mode`, `online`
+ *   - `valve`, `lock` — `ON`/`OFF` text, not JSON — never reaches this
+ *     module (see `mqttService.ts`'s JSON-parsing guard)
+ *
+ * Since each field arrives as its own retained message rather than one
+ * combined state payload, `parseZoneStateMessage` returns a *partial* patch
+ * for whichever single field the topic identifies; `zoneService.upsertZone`
+ * merges those partial patches over time so a zone's known fields survive
+ * across messages that only report one value.
+ *
+ * Setpoint writes are published to `<baseTopic>/<deviceId>/<zoneId>/set_temp`
+ * as a plain-text number (not JSON) — the firmware parses it with
+ * `String::toFloat()`.
  *
  * All fields are read explicitly by name below (no positional/array
  * decoding) specifically to avoid the class of bug where two numeric
@@ -32,30 +46,46 @@ import type { Zone } from '../zoneService.js';
 
 export interface ParsedZoneState {
   zoneId: number;
+  deviceId: string;
   patch: Partial<Omit<Zone, 'id'>>;
 }
 
-const STATE_TOPIC_RE = /^(.+)\/(\d+)\/state$/;
+const FIELD_TOPIC_RE = /^(.+)\/([^/]+)\/(\d+)\/([A-Za-z0-9_]+)$/;
+
+const KNOWN_FIELDS = new Set([
+  'current_temp',
+  'target_temp',
+  'battery',
+  'rssi',
+  'current_draw',
+  'attributes',
+]);
 
 /**
- * Attempts to interpret an MQTT topic + decoded JSON payload as a zone state
+ * Attempts to interpret an MQTT topic + decoded JSON payload as a zone
  * update for the given base topic. Returns `null` when the topic doesn't
- * match the expected `<baseTopic>/<zoneId>/state` shape, or when the
- * payload isn't a JSON object — callers should treat that as "not a zone
- * state message" rather than an error.
+ * match the expected `<baseTopic>/<deviceId>/<zoneId>/<field>` shape, the
+ * zone id isn't numeric (e.g. the `master` topics), the field isn't one of
+ * the known per-zone fields, or the payload has the wrong shape for that
+ * field — callers should treat that as "not a zone update" rather than an
+ * error.
  */
 export function parseZoneStateMessage(
   topic: string,
   baseTopic: string,
   payload: unknown,
 ): ParsedZoneState | null {
-  const match = STATE_TOPIC_RE.exec(topic);
+  const match = FIELD_TOPIC_RE.exec(topic);
   if (!match) {
     return null;
   }
 
-  const [, matchedBaseTopic, zoneIdRaw] = match;
+  const [, matchedBaseTopic, deviceId, zoneIdRaw, field] = match;
   if (matchedBaseTopic !== baseTopic) {
+    return null;
+  }
+
+  if (!KNOWN_FIELDS.has(field)) {
     return null;
   }
 
@@ -64,53 +94,78 @@ export function parseZoneStateMessage(
     return null;
   }
 
-  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-    return null;
-  }
-
-  const data = payload as Record<string, unknown>;
   const patch: Partial<Omit<Zone, 'id'>> = {};
 
-  const name = asString(data.name);
-  if (name !== undefined) patch.name = name;
+  switch (field) {
+    case 'current_temp': {
+      const value = asFiniteNumber(payload);
+      if (value === undefined) return null;
+      patch.currentTemp = value;
+      break;
+    }
+    case 'target_temp': {
+      const value = asFiniteNumber(payload);
+      if (value === undefined) return null;
+      patch.targetTemp = value;
+      break;
+    }
+    case 'battery':
+    case 'rssi':
+    case 'current_draw': {
+      // Recognized telemetry fields confirming the zone is alive. Not
+      // (yet) part of the Zone model, but they must not be logged as
+      // unrecognized/ignored — they still count as a valid zone update.
+      if (asFiniteNumber(payload) === undefined) return null;
+      break;
+    }
+    case 'attributes': {
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+        return null;
+      }
+      const data = payload as Record<string, unknown>;
 
-  const currentTemp = asFiniteNumber(data.current_temp);
-  if (currentTemp !== undefined) patch.currentTemp = currentTemp;
+      const room = asString(data.room);
+      if (room !== undefined) patch.name = room;
 
-  const targetTemp = asFiniteNumber(data.target_temp);
-  if (targetTemp !== undefined) patch.targetTemp = targetTemp;
+      const minTemp = asFiniteNumber(data.min_temp);
+      if (minTemp !== undefined) patch.minTemp = minTemp;
 
-  const minTemp = asFiniteNumber(data.min_temp);
-  if (minTemp !== undefined) patch.minTemp = minTemp;
+      const maxTemp = asFiniteNumber(data.max_temp);
+      if (maxTemp !== undefined) patch.maxTemp = maxTemp;
 
-  const maxTemp = asFiniteNumber(data.max_temp);
-  if (maxTemp !== undefined) patch.maxTemp = maxTemp;
+      const comfortTemp = asFiniteNumber(data.comfort_temp);
+      if (comfortTemp !== undefined) patch.comfortTemp = comfortTemp;
 
-  const comfortTemp = asFiniteNumber(data.comfort_temp);
-  if (comfortTemp !== undefined) patch.comfortTemp = comfortTemp;
+      const ecoTemp = asFiniteNumber(data.eco_temp);
+      if (ecoTemp !== undefined) patch.ecoTemp = ecoTemp;
 
-  const ecoTemp = asFiniteNumber(data.eco_temp);
-  if (ecoTemp !== undefined) patch.ecoTemp = ecoTemp;
+      const mode = asZoneMode(data.mode);
+      if (mode !== undefined) patch.mode = mode;
 
-  const mode = asZoneMode(data.mode);
-  if (mode !== undefined) patch.mode = mode;
-
-  const online = asBoolean(data.online);
-  if (online !== undefined) patch.online = online;
+      const online = asBoolean(data.online);
+      if (online !== undefined) patch.online = online;
+      break;
+    }
+    default:
+      return null;
+  }
 
   patch.lastUpdated = new Date().toISOString();
 
-  return { zoneId, patch };
+  return { zoneId, deviceId, patch };
 }
 
 /** Builds the command topic a setpoint change should be published to. */
-export function buildSetpointTopic(baseTopic: string, zoneId: number): string {
-  return `${baseTopic}/${zoneId}/set`;
+export function buildSetpointTopic(baseTopic: string, deviceId: string, zoneId: number): string {
+  return `${baseTopic}/${deviceId}/${zoneId}/set_temp`;
 }
 
-/** Builds the JSON payload for a setpoint change command. */
+/**
+ * Builds the payload for a setpoint change command. The firmware expects a
+ * plain-text number (parsed with `String::toFloat()`), not JSON.
+ */
 export function buildSetpointPayload(targetTemp: number): string {
-  return JSON.stringify({ target_temp: targetTemp });
+  return String(targetTemp);
 }
 
 function asString(value: unknown): string | undefined {
