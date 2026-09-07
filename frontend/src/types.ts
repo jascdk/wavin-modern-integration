@@ -22,6 +22,7 @@ export interface ApiStatus {
 
 export interface Zone {
   id: number;
+  deviceId: string | null;
   name: string;
   currentTemp: number | null;
   targetTemp: number | null;

@@ -1,7 +1,7 @@
 import mqtt, { type MqttClient } from 'mqtt';
 import { config } from '../config/index.js';
 import { buildSetpointPayload, buildSetpointTopic, parseZoneStateMessage } from './adapters/wavinAhc9000.js';
-import { upsertZone } from './zoneService.js';
+import { getZone, upsertZone } from './zoneService.js';
 
 export interface MqttStatus {
   connected: boolean;
@@ -120,7 +120,7 @@ export function startMqttClient(): MqttClient {
       return;
     }
 
-    upsertZone(zoneState.zoneId, zoneState.patch);
+    upsertZone(zoneState.zoneId, zoneState.patch, zoneState.deviceId);
   });
 
   return client;
@@ -129,14 +129,19 @@ export function startMqttClient(): MqttClient {
 /**
  * Publishes a setpoint change to the bridge's command topic for the given
  * zone. Returns a promise that resolves once the broker has acknowledged
- * the publish, and rejects if no MQTT client is connected or the publish
+ * the publish, and rejects if no MQTT client is connected, the zone's
+ * device id isn't known yet (no MQTT message seen for it), or the publish
  * fails.
  */
 export async function publishSetpoint(zoneId: number, targetTemp: number): Promise<void> {
   if (!client || !status.connected) {
     throw new Error('mqtt client is not connected');
   }
-  const topic = buildSetpointTopic(config.mqtt.baseTopic, zoneId);
+  const zone = getZone(zoneId);
+  if (!zone?.deviceId) {
+    throw new Error('zone device id is not known yet');
+  }
+  const topic = buildSetpointTopic(config.mqtt.baseTopic, zone.deviceId, zoneId);
   const payload = buildSetpointPayload(targetTemp);
   await client.publishAsync(topic, payload, { qos: 1 });
 }
