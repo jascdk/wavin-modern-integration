@@ -1,5 +1,7 @@
 import mqtt, { type MqttClient } from 'mqtt';
 import { config } from '../config/index.js';
+import { buildSetpointPayload, buildSetpointTopic, parseZoneStateMessage } from './adapters/wavinAhc9000.js';
+import { upsertZone } from './zoneService.js';
 
 export interface MqttStatus {
   connected: boolean;
@@ -39,9 +41,10 @@ export function safeParseJsonPayload(payload: Buffer): unknown | null {
   }
 }
 
-function subscribePlaceholders(mqttClient: MqttClient): void {
-  // Placeholder subscriptions. Hardware-specific topics will be wired up by
-  // the future adapter for jascdk/wavin_ahc9000_advanced_mqtt (see docs/architecture.md).
+function subscribeZoneTopics(mqttClient: MqttClient): void {
+  // Subscribes to every topic under the base topic; `parseZoneStateMessage`
+  // (adapters/wavinAhc9000.ts) filters down to the ones that match the
+  // `<baseTopic>/<zoneId>/state` shape it understands.
   const topics = [`${config.mqtt.baseTopic}/#`];
 
   for (const topic of topics) {
@@ -76,7 +79,7 @@ export function startMqttClient(): MqttClient {
     status.lastConnectedAt = new Date().toISOString();
     status.lastError = null;
     console.log('[mqtt] connected');
-    subscribePlaceholders(client as MqttClient);
+    subscribeZoneTopics(client as MqttClient);
   });
 
   client.on('reconnect', () => {
@@ -110,11 +113,32 @@ export function startMqttClient(): MqttClient {
       console.warn(`[mqtt] received non-JSON payload on ${topic}, ignoring`);
       return;
     }
-    // Placeholder: route decoded messages into zone state / activity log here.
-    console.log(`[mqtt] message on ${topic}:`, JSON.stringify(parsed));
+
+    const zoneState = parseZoneStateMessage(topic, config.mqtt.baseTopic, parsed);
+    if (zoneState === null) {
+      console.log(`[mqtt] unrecognized message on ${topic}:`, JSON.stringify(parsed));
+      return;
+    }
+
+    upsertZone(zoneState.zoneId, zoneState.patch);
   });
 
   return client;
+}
+
+/**
+ * Publishes a setpoint change to the bridge's command topic for the given
+ * zone. Returns a promise that resolves once the broker has acknowledged
+ * the publish, and rejects if no MQTT client is connected or the publish
+ * fails.
+ */
+export async function publishSetpoint(zoneId: number, targetTemp: number): Promise<void> {
+  if (!client || !status.connected) {
+    throw new Error('mqtt client is not connected');
+  }
+  const topic = buildSetpointTopic(config.mqtt.baseTopic, zoneId);
+  const payload = buildSetpointPayload(targetTemp);
+  await client.publishAsync(topic, payload, { qos: 1 });
 }
 
 export function getMqttStatus(): MqttStatus {

@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.6",

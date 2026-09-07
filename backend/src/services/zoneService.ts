@@ -1,22 +1,71 @@
 export interface Zone {
   id: number;
   name: string;
-  temp: number;
-  target: number;
+  currentTemp: number | null;
+  targetTemp: number | null;
+  minTemp: number | null;
+  maxTemp: number | null;
+  comfortTemp: number | null;
+  ecoTemp: number | null;
   mode: 'auto' | 'manual' | 'away' | 'off';
   online: boolean;
+  lastUpdated: string | null;
 }
 
-// Placeholder data. This will be backed by live MQTT state once the
-// wavin_ahc9000_advanced_mqtt adapter is implemented (see docs/architecture.md).
-const zones: Zone[] = [
-  { id: 1, name: 'Living Room', temp: 21.4, target: 22.0, mode: 'auto', online: true },
-  { id: 2, name: 'Kitchen', temp: 20.1, target: 21.0, mode: 'auto', online: true },
-  { id: 3, name: 'Bedroom', temp: 18.6, target: 19.0, mode: 'manual', online: true },
-  { id: 4, name: 'Bathroom', temp: 22.8, target: 23.5, mode: 'auto', online: false },
-  { id: 5, name: 'Office', temp: 19.9, target: 20.5, mode: 'away', online: true },
-];
+// Live zone state, keyed by zone id. Populated exclusively by
+// `adapters/wavinAhc9000.ts` as MQTT state messages arrive — there is no
+// hardcoded seed data, so an empty store simply means no messages have been
+// received yet (see ZonesTable's "No zones loaded yet" empty state).
+const zones = new Map<number, Zone>();
 
 export function getZones(): Zone[] {
-  return zones;
+  return Array.from(zones.values()).sort((a, b) => a.id - b.id);
+}
+
+export function getZone(id: number): Zone | undefined {
+  return zones.get(id);
+}
+
+/**
+ * Inserts or merges a partial zone update (as decoded from an MQTT state
+ * payload) into the store. Existing fields are preserved when the incoming
+ * payload omits them, so a message that only reports e.g. `current_temp`
+ * doesn't wipe out previously known `min_temp`/`max_temp` values.
+ */
+export function upsertZone(id: number, patch: Partial<Omit<Zone, 'id'>>): Zone {
+  const existing = zones.get(id);
+  const merged: Zone = {
+    id,
+    name: existing?.name ?? `Zone ${id}`,
+    currentTemp: existing?.currentTemp ?? null,
+    targetTemp: existing?.targetTemp ?? null,
+    minTemp: existing?.minTemp ?? null,
+    maxTemp: existing?.maxTemp ?? null,
+    comfortTemp: existing?.comfortTemp ?? null,
+    ecoTemp: existing?.ecoTemp ?? null,
+    mode: existing?.mode ?? 'auto',
+    online: existing?.online ?? true,
+    lastUpdated: existing?.lastUpdated ?? null,
+    ...patch,
+  };
+  zones.set(id, merged);
+  return merged;
+}
+
+/**
+ * Optimistically applies a locally-initiated target temperature change ahead
+ * of the broker echoing back a confirmed state message. Used by the
+ * `PATCH /api/zones/:id` write path.
+ */
+export function setZoneTargetTemp(id: number, targetTemp: number): Zone | undefined {
+  const existing = zones.get(id);
+  if (!existing) {
+    return undefined;
+  }
+  return upsertZone(id, { targetTemp });
+}
+
+/** Clears all zone state. Exported for tests only. */
+export function resetZonesForTest(): void {
+  zones.clear();
 }

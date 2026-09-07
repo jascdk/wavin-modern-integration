@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { fetchStatus, fetchZones } from './api/client';
+import { fetchStatus, fetchZones, setZoneTarget } from './api/client';
 import type { ActivityEntry, ApiStatus, Zone } from './types';
 import Header from './components/Header';
 import StatusCards from './components/StatusCards';
@@ -44,13 +44,32 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const handleSetTarget = useCallback(
+    async (id: number, targetTemp: number) => {
+      try {
+        const result = await setZoneTarget(id, targetTemp);
+        if (result.zone) {
+          setZones((current) => current.map((z) => (z.id === id ? result.zone! : z)));
+        }
+        log(`Zone ${id}: target set to ${targetTemp.toFixed(1)}°C`, 'info');
+      } catch (err) {
+        log(`Zone ${id}: failed to set target — ${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    },
+    [log],
+  );
+
   return (
     <div className="app">
       <Header />
       <main className="content">
         <StatusCards apiReachable={apiReachable} status={status} lastUpdate={lastUpdate} />
         <div className="panels">
-          <ZonesTable zones={zones} />
+          <ZonesTable
+            zones={zones}
+            mqttConnected={status?.mqtt.connected ?? false}
+            onSetTarget={handleSetTarget}
+          />
           <ActivityLog entries={activity} />
         </div>
       </main>
